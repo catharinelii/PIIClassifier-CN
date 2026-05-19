@@ -1,17 +1,20 @@
 """LLM-label a fresh pool of complaints to expand the training set.
 
-Two phases — run them on different machines:
+Two phases:
 
-  PHASE 1  (local, no GPU — needs cache.parquet):
-      python notebooks/06_llm_label.py --sample-only --n 2000
-    Stratified-samples N complaints (excluding rows already in
+  PHASE 1  (local — needs cache.parquet):
+      python notebooks/llmLabel.py --sample-only --n 2000
+    Stratified-samples N non-empty complaints (excluding rows already in
     data/gold.jsonl) and writes data/llm_pool.jsonl — a small file.
 
-  PHASE 2  (Colab GPU — needs vLLM + data/llm_pool.jsonl):
-      python notebooks/06_llm_label.py --model Qwen/Qwen3-8B
-    Reads data/llm_pool.jsonl, labels each row with vLLM (schema-enforced
-    JSON), recovers character offsets by exact string search, and writes
-    data/llm_labeled.jsonl in our gold schema.
+  PHASE 2  (anywhere with internet — needs the OpenAI API + llm_pool.jsonl):
+      python notebooks/llmLabel.py --model gpt-5.4-mini
+    Reads data/llm_pool.jsonl, labels each row by calling the OpenAI API
+    concurrently (JSON-schema structured output), recovers character offsets
+    by exact string search, and writes data/llm_labeled.jsonl.
+
+Needs OPENAI_API_KEY in the environment. No GPU required — phase 2 is just
+API calls, so it runs on a laptop or in Colab (CPU runtime is fine).
 
 The 50-row human-verified test set is never touched here — this output is
 training/dev data only.
@@ -20,8 +23,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,36 +38,45 @@ OUT = ROOT / "data" / "llm_labeled.jsonl"
 OUR_TYPES = ["ADDRESS", "PHONE", "ID", "PERSON", "ORG",
              "DATE", "PLATE", "ACCOUNT", "EMAIL", "URL", "SECRET"]
 
-# Structured-output schema: LLM emits surface string + one of our 11 types.
-# Deliberately NO start/end — LLMs hallucinate offsets; we recover them below.
-PRIVACY_SCHEMA = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "properties": {
-            "original_text": {"type": "string"},
-            "type": {"type": "string", "enum": OUR_TYPES},
+# OpenAI Structured Outputs requires the schema root to be an object, so the
+# span list is wrapped under "spans". `strict` mode requires every object to
+# set additionalProperties:false and list all properties in `required`.
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "spans": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "original_text": {"type": "string"},
+                    "type": {"type": "string", "enum": OUR_TYPES},
+                },
+                "required": ["original_text", "type"],
+                "additionalProperties": False,
+            },
         },
-        "required": ["original_text", "type"],
-        "additionalProperties": False,
     },
+    "required": ["spans"],
+    "additionalProperties": False,
 }
 
 SYSTEM_PROMPT = """You are a professional PII annotator for a Chinese municipal complaint-hotline dataset. Read one complaint record and extract every span of personally identifiable information, following the rules below exactly.
 
 # Output
-Return a JSON array. Each item: {"original_text": <verbatim substring>, "type": <one of the 11 types>}. If there is no PII, return [].
+Return a JSON object {"spans": [...]}. Each span: {"original_text": <verbatim substring>, "type": <one of the 11 types>}. If there is no PII, return {"spans": []}.
 CRITICAL: `original_text` MUST be copied character-for-character from the input — no paraphrase, no masking, no added or removed characters. We locate the span by exact string match; a non-verbatim copy is discarded.
+Be THOROUGH: almost every complaint names at least one address. Extract an address even when it is woven mid-sentence (e.g. after 在 / 自己是…居民), not only when it follows an obvious cue like 住在 or 地址：.
 
 # The 11 types
 - ADDRESS  — a specific place: administrative chain (区/镇/村), road + number, building, unit.
 - PHONE    — a personal mobile or landline number.
 - ID       — a Chinese national ID (身份证), 15 or 18 digits.
 - PERSON   — any named human (family + given name). EVERY named person, public or private — officials included.
-- ORG      — a specific PRIVATE organization (company, shop, workplace). NOT government bodies (X局 / X委 / X部 / 政府 / 纪委 / 派出所 / 居委会 / 村委会), NOT public hospitals or schools, NOT household-name brands (京东, 海底捞, 我爱我家…). Those are hard negatives — do not extract them.
+- ORG      — a specific PRIVATE organization (company, shop, workplace). NOT government bodies (X局 / X委 / X部 / 政府 / 纪委 / 派出所 / 居委会 / 村委会 / 仲裁), NOT public hospitals or schools, NOT household-name brands (京东, 海底捞, 我爱我家…). Those are hard negatives — do not extract them.
 - DATE     — a specific calendar date or date-time. NOT relative time (今天 / 昨天 / 上周).
 - PLATE    — a vehicle license plate.
-- ACCOUNT  — a bank / payment card or other personal account number.
+- ACCOUNT  — a bank / payment card or other personal account number. NOT money amounts (2105元 is not an ACCOUNT).
 - EMAIL    — an email address.
 - URL      — a web URL.
 - SECRET   — a password, key, or verification code.
@@ -75,17 +89,17 @@ CRITICAL: `original_text` MUST be copied character-for-character from the input 
 - Relative time: 今天, 昨天, 上周
 
 # Granularity
-Extract the minimal sensitive entity, never a full sentence.
+Extract the minimal sensitive entity, never a full sentence. Each entity gets its own span — never merge an address and an org, or an org and a person, into one span.
 - Drop leading verbs / labels: "市民住在大兴区高庄村" → "大兴区高庄村"; "姓名：张新军" → "张新军".
 - Drop trailing particles and punctuation.
 
 # Example
 Input: 市民反映，自己住在大兴区青云店镇沙堆营村，拖欠人姓名张新军，身份证622628197706173738，老板电话18710106706，要求大兴区住建委处理。
 Output:
-[{"original_text":"大兴区青云店镇沙堆营村","type":"ADDRESS"},
+{"spans":[{"original_text":"大兴区青云店镇沙堆营村","type":"ADDRESS"},
  {"original_text":"张新军","type":"PERSON"},
  {"original_text":"622628197706173738","type":"ID"},
- {"original_text":"18710106706","type":"PHONE"}]
+ {"original_text":"18710106706","type":"PHONE"}]}
 (大兴区住建委 is a government body → not extracted. 市民 is a pronoun → not extracted.)
 
 # Input complaint
@@ -155,6 +169,7 @@ def sample_pool(n: int, seed: int) -> None:
                 for l in GOLD.open(encoding="utf-8")}
     df = df[~df.index.isin(used)]
     df["lb"] = df["EVENT_DESC"].map(length_bucket)
+    df = df[df["lb"] != "empty"]          # empty-text rows teach the NER nothing
     rng = random.Random(seed)
     rows: list[dict] = []
     for _, grp in df.groupby("lb"):
@@ -166,55 +181,72 @@ def sample_pool(n: int, seed: int) -> None:
     with POOL.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    size_kb = POOL.stat().st_size / 1024
     print(f"Phase 1 done: wrote {len(rows)} rows → {POOL.relative_to(ROOT)} "
-          f"({size_kb:.0f} KB). Upload this file to Colab for phase 2.")
+          f"({POOL.stat().st_size/1024:.0f} KB).")
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — label the pool (Colab GPU)
+# Phase 2 — label the pool (OpenAI API)
 # ---------------------------------------------------------------------------
-def label_pool(model_name: str) -> None:
+def label_pool(model_name: str, workers: int) -> None:
     if not POOL.exists():
         raise SystemExit(
-            f"missing {POOL.relative_to(ROOT)} — run phase 1 (--sample-only) "
-            f"locally first, then upload the file here.")
-    from vllm import LLM, SamplingParams
-    from vllm.sampling_params import StructuredOutputsParams
-    from transformers import AutoTokenizer
+            f"missing {POOL.relative_to(ROOT)} — run phase 1 (--sample-only) first.")
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise SystemExit("set OPENAI_API_KEY in the environment first.")
+    from openai import OpenAI
 
-    pool = [json.loads(l) for l in POOL.open(encoding="utf-8")]
-    print(f"Labeling {len(pool)} rows with {model_name}")
+    raw = [json.loads(l) for l in POOL.open(encoding="utf-8")]
+    # Empty-text rows can't carry PII and teach the NER nothing — skip them
+    # entirely (also saves an API call each).
+    pool = [r for r in raw if r["text"].strip()]
+    skipped = len(raw) - len(pool)
+    print(f"Labeling {len(pool)} rows with {model_name} "
+          f"({skipped} empty-text rows skipped, {workers} workers)")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    sampling = SamplingParams(
-        temperature=0.1, top_p=0.1, repetition_penalty=1.05, max_tokens=2048,
-        structured_outputs=StructuredOutputsParams(json=PRIVACY_SCHEMA),
-    )
-    # max_model_len capped well below Qwen3's 40960 default: our complaints are
-    # short (longest ~4600 chars), and reserving KV cache for the full 40k
-    # context needs ~5.6 GB — more than a 16 GB T4 has free. 8192 needs ~1 GB.
-    llm = LLM(model=model_name, dtype="float16", gpu_memory_utilization=0.9,
-              max_model_len=8192)
+    # One client, shared across threads (the OpenAI client is thread-safe).
+    # max_retries lets the SDK back off automatically on 429 rate limits.
+    client = OpenAI(max_retries=5)
 
-    prompts = [tokenizer.apply_chat_template(
-        [{"role": "user", "content": SYSTEM_PROMPT + r["text"]}],
-        tokenize=False, add_generation_prompt=True,
-        enable_thinking=False)            # enable_thinking flag is Qwen3-specific
-        for r in pool]
+    def label_one(idx: int, text: str):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": SYSTEM_PROMPT + text}],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "pii_spans", "strict": True,
+                                    "schema": RESPONSE_SCHEMA},
+                },
+                # No temperature / max_tokens: some GPT-5.x models reject custom
+                # values for those. Structured output keeps results stable.
+            )
+            obj = json.loads(resp.choices[0].message.content)
+            u = resp.usage
+            return idx, obj.get("spans", []), (u.prompt_tokens, u.completion_tokens), None
+        except Exception as e:                           # noqa: BLE001
+            return idx, [], (0, 0), str(e)
 
+    results: list = [None] * len(pool)
     t0 = time.time()
-    outputs = llm.generate(prompts, sampling)
-    print(f"vLLM generate: {time.time()-t0:.0f}s")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(label_one, i, r["text"]): i for i, r in enumerate(pool)}
+        done = 0
+        for fut in as_completed(futs):
+            idx, items, usage, err = fut.result()
+            results[idx] = (items, usage, err)
+            done += 1
+            if done % 100 == 0 or done == len(pool):
+                print(f"  {done}/{len(pool)} ({time.time()-t0:.0f}s)")
 
-    total_spans = total_dropped = parse_fail = 0
+    total_spans = total_dropped = errors = 0
+    in_tok = out_tok = 0
     with OUT.open("w", encoding="utf-8") as f:
-        for r, out in zip(pool, outputs):
-            raw = out.outputs[0].text.strip()
-            try:
-                items = json.loads(raw)
-            except json.JSONDecodeError:
-                items, parse_fail = [], parse_fail + 1
+        for r, (items, usage, err) in zip(pool, results):
+            if err:
+                errors += 1
+            in_tok += usage[0]
+            out_tok += usage[1]
             spans, dropped = recover_spans(r["text"], items)
             total_spans += len(spans)
             total_dropped += dropped
@@ -225,17 +257,19 @@ def label_pool(model_name: str) -> None:
                 "spans": spans,
                 "uncertain": False,
                 "notes": "",
-                "annotator": f"llm:{model_name}",
+                "annotator": f"openai:{model_name}",
                 "annotated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }, ensure_ascii=False) + "\n")
 
     print(f"\nPhase 2 done: wrote {len(pool)} rows → {OUT.relative_to(ROOT)}")
     print(f"  spans kept:    {total_spans}")
     print(f"  spans dropped: {total_dropped}  (surface not found verbatim)")
-    print(f"  parse fails:   {parse_fail}")
+    print(f"  API errors:    {errors}")
+    print(f"  tokens:        {in_tok:,} in + {out_tok:,} out "
+          f"(estimate cost from current OpenAI pricing)")
     if total_spans + total_dropped:
         rate = total_dropped / (total_spans + total_dropped) * 100
-        print(f"  drop rate:     {rate:.1f}%  (>10% → tighten prompt / bigger model)")
+        print(f"  drop rate:     {rate:.1f}%")
 
 
 def main() -> None:
@@ -244,13 +278,15 @@ def main() -> None:
                     help="phase 1: sample the pool and exit")
     ap.add_argument("--n", type=int, default=2000, help="rows to sample (phase 1)")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--model", help="HF model id for vLLM (phase 2)")
+    ap.add_argument("--model", help="OpenAI model id for labeling (phase 2)")
+    ap.add_argument("--workers", type=int, default=20,
+                    help="concurrent API requests (phase 2)")
     args = ap.parse_args()
 
     if args.sample_only:
         sample_pool(args.n, args.seed)
     elif args.model:
-        label_pool(args.model)
+        label_pool(args.model, args.workers)
     else:
         raise SystemExit("pass --sample-only (phase 1) or --model NAME (phase 2)")
 
