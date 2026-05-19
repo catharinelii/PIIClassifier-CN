@@ -188,10 +188,14 @@ def label_pool(model_name: str) -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     sampling = SamplingParams(
-        temperature=0.1, top_p=0.1, repetition_penalty=1.05, max_tokens=4096,
+        temperature=0.1, top_p=0.1, repetition_penalty=1.05, max_tokens=2048,
         structured_outputs=StructuredOutputsParams(json=PRIVACY_SCHEMA),
     )
-    llm = LLM(model=model_name, dtype="float16", gpu_memory_utilization=0.9)
+    # max_model_len capped well below Qwen3's 40960 default: our complaints are
+    # short (longest ~4600 chars), and reserving KV cache for the full 40k
+    # context needs ~5.6 GB — more than a 16 GB T4 has free. 8192 needs ~1 GB.
+    llm = LLM(model=model_name, dtype="float16", gpu_memory_utilization=0.9,
+              max_model_len=8192)
 
     prompts = [tokenizer.apply_chat_template(
         [{"role": "user", "content": SYSTEM_PROMPT + r["text"]}],
