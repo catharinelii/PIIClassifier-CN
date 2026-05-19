@@ -1,0 +1,23 @@
+<View>
+  <Header value="Dept: $department | Length: $length_bucket | Channel: $channel | id: $id"/>
+  <Text name="text" value="$text" granularity="symbol"/>
+  <Labels name="label" toName="text">
+    <Label value="ADDRESS" hotkey="a" background="#ffadad"/>
+    <Label value="PHONE" hotkey="p" background="#ffd6a5"/>
+    <Label value="ID" hotkey="i" background="#fdffb6"/>
+    <Label value="PERSON" hotkey="n" background="#caffbf"/>
+    <Label value="ORG" hotkey="o" background="#9bf6ff"/>
+    <Label value="DATE" hotkey="d" background="#a0c4ff"/>
+    <Label value="PLATE" hotkey="l" background="#bdb2ff"/>
+    <Label value="ACCOUNT" hotkey="c" background="#ffc6ff"/>
+    <Label value="EMAIL" hotkey="e" background="#d3d3d3"/>
+    <Label value="URL" hotkey="u" background="#e0e0e0"/>
+    <Label value="SECRET" hotkey="s" background="#ff9999"/>
+  </Labels>
+  <Choices name="uncertain" toName="text" choice="single">
+    <Choice value="Uncertain — flag for review"/>
+  </Choices>
+  <TextArea name="notes" toName="text"
+            placeholder="Notes — record any sticky decisions for guide revision"
+            rows="2" maxSubmissions="1" editable="true"/>
+</View>
