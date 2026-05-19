@@ -206,7 +206,7 @@ def label_pool(model_name: str, workers: int) -> None:
 
     # One client, shared across threads (the OpenAI client is thread-safe).
     # max_retries lets the SDK back off automatically on 429 rate limits.
-    client = OpenAI(max_retries=5)
+    client = OpenAI(max_retries=8)
 
     def label_one(idx: int, text: str):
         try:
@@ -239,17 +239,19 @@ def label_pool(model_name: str, workers: int) -> None:
             if done % 100 == 0 or done == len(pool):
                 print(f"  {done}/{len(pool)} ({time.time()-t0:.0f}s)")
 
-    total_spans = total_dropped = errors = 0
+    total_spans = total_dropped = errors = written = 0
     in_tok = out_tok = 0
     with OUT.open("w", encoding="utf-8") as f:
         for r, (items, usage, err) in zip(pool, results):
-            if err:
-                errors += 1
             in_tok += usage[0]
             out_tok += usage[1]
+            if err:
+                errors += 1
+                continue                       # failed rows are NOT written
             spans, dropped = recover_spans(r["text"], items)
             total_spans += len(spans)
             total_dropped += dropped
+            written += 1
             f.write(json.dumps({
                 "id": f"row_{r['source_row_index']}",
                 "source_row_index": r["source_row_index"],
@@ -261,15 +263,18 @@ def label_pool(model_name: str, workers: int) -> None:
                 "annotated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }, ensure_ascii=False) + "\n")
 
-    print(f"\nPhase 2 done: wrote {len(pool)} rows → {OUT.relative_to(ROOT)}")
+    print(f"\nPhase 2 done: wrote {written}/{len(pool)} rows → {OUT.relative_to(ROOT)}")
     print(f"  spans kept:    {total_spans}")
     print(f"  spans dropped: {total_dropped}  (surface not found verbatim)")
-    print(f"  API errors:    {errors}")
+    print(f"  API errors:    {errors}  (these rows were NOT written)")
     print(f"  tokens:        {in_tok:,} in + {out_tok:,} out "
           f"(estimate cost from current OpenAI pricing)")
     if total_spans + total_dropped:
         rate = total_dropped / (total_spans + total_dropped) * 100
         print(f"  drop rate:     {rate:.1f}%")
+    if errors > len(pool) * 0.05:
+        print(f"\n  ⚠ {errors}/{len(pool)} rows failed — almost certainly rate "
+              f"limiting. Lower --workers (try 2-3) and re-run.")
 
 
 def main() -> None:
@@ -279,8 +284,9 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=2000, help="rows to sample (phase 1)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--model", help="OpenAI model id for labeling (phase 2)")
-    ap.add_argument("--workers", type=int, default=20,
-                    help="concurrent API requests (phase 2)")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="concurrent API requests (phase 2). New API keys are "
+                         "on a low rate-limit tier — keep this small (2-4).")
     args = ap.parse_args()
 
     if args.sample_only:
