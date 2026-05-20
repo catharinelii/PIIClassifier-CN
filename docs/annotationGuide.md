@@ -14,7 +14,7 @@ Before any rule about specific entity types:
 
 ## 1. Label schema
 
-Eight types we actively annotate. The list is closed for the gold test set — adding a new type means we re-do work.
+Ten types we actively annotate. The list is closed for the gold test set — adding a new type means we re-do work.
 
 | Type | One-line definition |
 |---|---|
@@ -240,7 +240,29 @@ The annotation tool shows pre-filled spans from the Tier-0 regex extractors as *
 
 Add entries here as you encounter them. Format: situation, decision, rationale, date.
 
-> *(empty until annotation starts — fill this section in as you go)*
+- **2026-05-19 — SECRET dropped from the schema (11 → 10 types).** An audit
+  of every labeled file turned up **0 real SECRET spans**: 298-row Codex gold
+  and the 50-row test set produced zero; the 2,000-row LLM-labeled batch
+  produced 5, and **all 5 were false positives** — two order numbers
+  (`热线-…-…`), the medication name `白普乐`, the noun phrase `个人二维码`,
+  and the bare word `密码` (the citizen complaining they'd *forgotten* their
+  password, not stating one). Municipal complaint text doesn't contain
+  passwords, keys, or verification codes. Keeping the class would have
+  trained the model on those five wrong patterns as the *only* signal for
+  SECRET — actively harmful. The class is removed from the label space,
+  `llmLabel.py` prompt, Label Studio config, and `spans.py`. If the project
+  ever extends to a domain that has real secrets (customer support, banking),
+  re-add as a future schema version.
+- **2026-05-20 — fragmented addresses.** When the same location is mentioned
+  in two places in a row (e.g. `…大兴区居然之家…居然之家1楼…`), label each
+  occurrence as its own ADDRESS span — spans must be contiguous character
+  ranges, you can't stitch non-adjacent fragments into one. This is correct
+  per §2.3 ("same entity mentioned twice = two separate spans") and gives the
+  model two valid local patterns to learn (district+landmark, landmark+unit).
+  Context-anchored landmark fragments (the second `居然之家1楼` is anchored
+  by the earlier `大兴区` in the row) are labeled; a *bare* landmark with no
+  anchor anywhere in the row falls back to §3.1's "lean toward no-label,
+  mark uncertain."
 
 ---
 

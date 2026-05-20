@@ -1,7 +1,9 @@
 data/
+sft/
 __pycache__/
 *.pyc
 .venv/
 *.parquet
 *.xlsx
 *.log
+.DS_Store

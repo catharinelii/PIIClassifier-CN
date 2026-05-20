@@ -36,7 +36,7 @@ POOL = ROOT / "data" / "llm_pool.jsonl"
 OUT = ROOT / "data" / "llm_labeled.jsonl"
 
 OUR_TYPES = ["ADDRESS", "PHONE", "ID", "PERSON", "ORG",
-             "DATE", "PLATE", "ACCOUNT", "EMAIL", "URL", "SECRET"]
+             "DATE", "PLATE", "ACCOUNT", "EMAIL", "URL"]
 
 # OpenAI Structured Outputs requires the schema root to be an object, so the
 # span list is wrapped under "spans". `strict` mode requires every object to
@@ -79,7 +79,6 @@ Be THOROUGH: almost every complaint names at least one address. Extract an addre
 - ACCOUNT  — a bank / payment card or other personal account number. NOT money amounts (2105元 is not an ACCOUNT).
 - EMAIL    — an email address.
 - URL      — a web URL.
-- SECRET   — a password, key, or verification code.
 
 # Never extract
 - Case numbers: 兴[2024]-0335006

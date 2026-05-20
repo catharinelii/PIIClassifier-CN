@@ -12,7 +12,6 @@
     <Label value="ACCOUNT" hotkey="c" background="#ffc6ff"/>
     <Label value="EMAIL" hotkey="e" background="#d3d3d3"/>
     <Label value="URL" hotkey="u" background="#e0e0e0"/>
-    <Label value="SECRET" hotkey="s" background="#ff9999"/>
   </Labels>
   <Choices name="uncertain" toName="text" choice="single">
     <Choice value="Uncertain — flag for review"/>

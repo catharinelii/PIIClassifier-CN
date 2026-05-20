@@ -29,7 +29,7 @@ class PIIType(str, Enum):
     ID = "ID"            # Chinese 身份证, separate from generic accounts
     PLATE = "PLATE"      # 车牌, Chinese-specific
     ORG = "ORG"          # company / institution names
-    SECRET = "SECRET"    # passwords, API keys (rare here)
+    # SECRET removed 2026-05-19 — see docs/annotationGuide.md §6.
 
 
 @dataclass(frozen=True)

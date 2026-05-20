@@ -88,7 +88,6 @@ Click any task → the annotation UI appears.
 | `c` | Tag selection as `ACCOUNT` (card) |
 | `e` | Tag selection as `EMAIL` |
 | `u` | Tag selection as `URL` |
-| `s` | Tag selection as `SECRET` |
 | `Ctrl+Enter` | Submit + load next task |
 | `Esc` | Clear current selection |
 
