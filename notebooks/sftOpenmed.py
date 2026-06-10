@@ -226,7 +226,7 @@ def main() -> None:
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # transformers 5.x renamed `tokenizer=`
     )
 
     print("\nstarting training ...")
