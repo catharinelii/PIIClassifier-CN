@@ -43,12 +43,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from evalSft import score, report, OUR_TYPES, IN_SCHEMA, FULL_SCHEMA  # noqa: E402
 
-MODEL = "OpenMed/privacy-filter-multilingual"
+DEFAULT_MODEL = "OpenMed/privacy-filter-multilingual"
 
 # OpenMed's 54 ai4privacy categories -> our 10 types. Keys are NORMALISED
 # (lowercased, non-alphanumerics stripped) so they match whether the pipeline
 # emits raw config names (ORGANIZATION, BUILDINGNUMBER, VRM, DATEOFBIRTH) or
 # canonical ones (street_address, vehicle_registration, account_number).
+# The last block adds identity mappings for our own 10 types so this same
+# script also works when --model points at our SFT'd checkpoint (which emits
+# our labels directly).
 OPENMED_TO_OURS = {
     # PERSON
     "firstname": "PERSON", "lastname": "PERSON", "middlename": "PERSON",
@@ -70,6 +73,8 @@ OPENMED_TO_OURS = {
     "creditcard": "ACCOUNT", "maskednumber": "ACCOUNT",
     # plate
     "vrm": "PLATE", "vehicleregistration": "PLATE",
+    # identity passthrough for our own SFT'd checkpoint
+    **{t.lower(): t for t in OUR_TYPES},
 }
 
 
@@ -105,6 +110,8 @@ def run_openmed(pipe, gold: list[dict], min_conf: float):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", required=True, help="verified test_gold.jsonl")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help="HF id or local checkpoint dir (e.g. our SFT'd model)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--min-conf", type=float, default=0.5,
                     help="drop predicted spans below this confidence (OpenMed default 0.5)")
@@ -116,14 +123,14 @@ def main() -> None:
     gold_sets = [{(s["start"], s["end"], s["type"]) for s in r["spans"]} for r in gold]
     print(f"loaded {len(gold)} test rows, {sum(len(g) for g in gold_sets)} gold spans")
 
-    print(f"\nloading {MODEL} (loads once) ...")
+    print(f"\nloading {args.model} (loads once) ...")
     try:
         from openmed.torch.privacy_filter import PrivacyFilterTorchPipeline
-        pipe = PrivacyFilterTorchPipeline(MODEL, device=args.device)
+        pipe = PrivacyFilterTorchPipeline(args.model, device=args.device)
     except Exception as e:  # fall back to the high-level factory (auto-cuda)
         print(f"  direct load failed ({e}); falling back to create_privacy_filter_pipeline")
         from openmed.core.backends import create_privacy_filter_pipeline
-        pipe = create_privacy_filter_pipeline(MODEL)
+        pipe = create_privacy_filter_pipeline(args.model)
 
     print(f"running zero-shot (min-conf={args.min_conf}) ...")
     preds, unmapped, sample = run_openmed(pipe, gold, args.min_conf)
@@ -136,9 +143,9 @@ def main() -> None:
             print(f"  {raw:>18} -> {str(mapped):>7}  [{a}:{b}]  {surf!r}")
 
     print("\n" + "=" * 66)
-    report("OPENMED-MULTILINGUAL (zero-shot)", gold_sets, preds)
+    report(args.model, gold_sets, preds)
 
-    print("\nOpenMed zero-shot per-type (full-schema):")
+    print(f"\n{args.model} per-type (full-schema):")
     res = score(gold_sets, preds, FULL_SCHEMA)
     for t in OUR_TYPES:
         if t in res["per"]:
