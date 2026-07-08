@@ -148,7 +148,16 @@ class ListDataset(torch.utils.data.Dataset):
 
 def load_jsonl(path: str, tokenizer, max_length: int) -> ListDataset:
     rows = [json.loads(l) for l in open(path, encoding="utf-8")]
-    return ListDataset([tokenize_and_tag(r, tokenizer, max_length) for r in rows])
+    items = [tokenize_and_tag(r, tokenizer, max_length) for r in rows]
+    # Drop examples that tokenize to zero tokens (empty/whitespace text). This
+    # tokenizer emits no special tokens for empty input, so such rows produce a
+    # 0-length sequence; a batch made entirely of them crashes attention with
+    # "cannot reshape tensor of 0 elements". Nothing to learn from them anyway.
+    kept = [it for it in items if len(it["input_ids"]) > 0]
+    dropped = len(items) - len(kept)
+    if dropped:
+        print(f"  dropped {dropped} empty-text rows from {path}")
+    return ListDataset(kept)
 
 
 def main() -> None:
