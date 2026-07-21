@@ -167,11 +167,17 @@ def main() -> None:
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--base", default=DEFAULT_BASE,
                     help="HF id or local dir of the base checkpoint to warm-start from")
-    # v1 hyperparams by default — keep the comparison clean
-    ap.add_argument("--epochs", type=int, default=3)
+    # HF full-FT of a from-scratch head needs a livelier schedule than v1's
+    # opf run. v1's lr=1e-5 / no-warmup left the reinitialized head essentially
+    # at init: grad_norm pinned ~200 vs max_grad_norm=1.0 throttled every step
+    # to ~5e-8, so the head never learned the O-prior and predicted noise. A
+    # higher lr + warmup + a few more epochs lets the head actually train.
+    ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--grad-accum", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--lr", type=float, default=5e-5)
+    ap.add_argument("--warmup-ratio", type=float, default=0.1,
+                    help="ramp lr from 0 to stabilize the huge initial grad_norm")
     ap.add_argument("--max-length", type=int, default=1024,
                     help="our complaint text is < 200 chars; 1024 is generous")
     args = ap.parse_args()
@@ -215,6 +221,7 @@ def main() -> None:
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
+        warmup_ratio=args.warmup_ratio,
         weight_decay=0.01,
         max_grad_norm=1.0,
         bf16=use_bf16,
