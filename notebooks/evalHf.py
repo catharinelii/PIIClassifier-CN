@@ -85,8 +85,76 @@ def decode_bioes(offsets, label_ids, id2label):
     return spans
 
 
-def run_hf(model, tokenizer, gold, device, max_length, show=0):
+NEG = float("-inf")
+
+
+def build_bioes_transitions(labels):
+    """BIOES legality masks over `labels`. Returns (trans, start, end) where
+    trans[i][j]=0 if label i may be followed by label j else -inf; start[k]/
+    end[k]=0 if label k is a legal first/last tag else -inf.
+
+    Rules: a "closed" state (O, E-*, S-*) may be followed only by O / B-* / S-*
+    (start something or nothing). An "open" state (B-x, I-x) may be followed
+    only by I-x / E-x of the SAME type. Sequences must start closed-openable
+    and end closed. This is what opf's Viterbi enforces — matching it here makes
+    the decode comparable across models instead of greedy-vs-Viterbi.
+    """
+    def parse(l):
+        if l == "O":
+            return ("O", None)
+        p, _, t = l.partition("-")
+        return (p, t)
+    kinds = [parse(l) for l in labels]
+    n = len(labels)
+    trans = [[NEG] * n for _ in range(n)]
+    for i, (pi, ti) in enumerate(kinds):
+        prev_closed = pi in ("O", "E", "S")
+        for j, (pj, tj) in enumerate(kinds):
+            legal = (pj in ("O", "B", "S")) if prev_closed else (pj in ("I", "E") and tj == ti)
+            if legal:
+                trans[i][j] = 0.0
+    start = [0.0 if p in ("O", "B", "S") else NEG for (p, _) in kinds]
+    end = [0.0 if p in ("O", "E", "S") else NEG for (p, _) in kinds]
+    return trans, start, end
+
+
+def viterbi(emissions, trans, start, end):
+    """Best legal label path. emissions: list[T] of per-token log-prob lists."""
+    L = len(emissions)
+    if L == 0:
+        return []
+    n = len(start)
+    dp = [start[k] + emissions[0][k] for k in range(n)]
+    bp = [[0] * n for _ in range(L)]
+    for t in range(1, L):
+        prev, emit = dp, emissions[t]
+        cur = [NEG] * n
+        for j in range(n):
+            best, arg = NEG, 0
+            tj = trans  # local
+            for i in range(n):
+                pi = prev[i]
+                if pi == NEG or tj[i][j] == NEG:
+                    continue
+                if pi > best:
+                    best, arg = pi, i
+            cur[j] = best + emit[j] if best != NEG else NEG
+            bp[t][j] = arg
+        dp = cur
+    dp = [dp[k] + end[k] for k in range(n)]
+    last = max(range(n), key=lambda k: dp[k])
+    path = [last]
+    for t in range(L - 1, 0, -1):
+        last = bp[t][last]
+        path.append(last)
+    path.reverse()
+    return path
+
+
+def run_hf(model, tokenizer, gold, device, max_length, decode="viterbi", show=0):
     id2label = model.config.id2label
+    labels = [id2label[i] for i in range(len(id2label))]
+    trans, start, end = build_bioes_transitions(labels)
     preds: list[set] = []
     shown = 0
     for r in gold:
@@ -103,7 +171,16 @@ def run_hf(model, tokenizer, gold, device, max_length, show=0):
             enc = {k: v.to(device) for k, v in enc.items()}
             with torch.no_grad():
                 logits = model(**enc).logits[0]
-            label_ids = logits.argmax(-1).tolist()
+            if decode == "greedy":
+                label_ids = logits.argmax(-1).tolist()
+            else:  # viterbi over the real (non-special) tokens only
+                real = [i for i, (a, b) in enumerate(offsets) if a != b]
+                logp = torch.log_softmax(logits.float(), dim=-1)
+                emissions = logp[real].tolist()
+                path = viterbi(emissions, trans, start, end)
+                label_ids = [0] * len(offsets)  # 0 == "O" for specials/others
+                for idx, lab in zip(real, path):
+                    label_ids[idx] = lab
             for (a, b, t) in decode_bioes(offsets, label_ids, id2label):
                 if b > a:
                     s.add((a, b, t))
@@ -122,6 +199,9 @@ def main() -> None:
     ap.add_argument("--model", required=True, help="HF token-classification checkpoint dir")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--max-length", type=int, default=2048)
+    ap.add_argument("--decode", choices=("viterbi", "greedy"), default="viterbi",
+                    help="viterbi = BIOES-constrained (matches opf, fair vs v1); "
+                         "greedy = raw argmax (over-fires, hurts precision)")
     ap.add_argument("--show", type=int, default=3, help="print predictions for the first N non-empty rows")
     args = ap.parse_args()
 
@@ -137,10 +217,12 @@ def main() -> None:
     print(f"  {model.config.num_labels} labels; e.g. "
           f"{[model.config.id2label[i] for i in range(min(5, model.config.num_labels))]}")
 
-    preds = run_hf(model, tokenizer, gold, args.device, args.max_length, args.show)
+    print(f"  decode: {args.decode}")
+    preds = run_hf(model, tokenizer, gold, args.device, args.max_length,
+                   decode=args.decode, show=args.show)
 
     print("\n" + "=" * 66)
-    report(args.model, gold_sets, preds)
+    report(f"{args.model}  [{args.decode}]", gold_sets, preds)
 
     print(f"\n{args.model} per-type (full-schema):")
     res = score(gold_sets, preds, FULL_SCHEMA)
